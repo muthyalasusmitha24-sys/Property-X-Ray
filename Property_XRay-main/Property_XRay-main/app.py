@@ -2,7 +2,6 @@
 app.py  --  Property X-Ray : Wellness Score  (Streamlit)
 Run:  streamlit run app.py
 """
-import io
 import os
  
 import numpy as np
@@ -17,10 +16,10 @@ import wellness_engine as we
 st.set_page_config(page_title="Property X-Ray – Wellness Score", page_icon="🏠", layout="wide")
 T.inject()
 T.hero("Wellness Score",
-       "A transparent, data-dependent wellness scoring workflow. Statistical diagnostics help assess the data; "
-       "they do not by themselves prove that a score is objectively valid.",
-       ["Data preprocessing", "Normalize", "Correlate", "Factor analysis", "Entropy", "Bootstrap", "Weights",
-        "Sub-factor scores", "Factor scores", "Wellness Score + CI"])
+       "A transparent scoring workflow that converts property measurements into factor scores and an overall score. "
+       "Diagnostics help assess the data; they do not by themselves prove that a score is objectively valid.",
+       ["Data preprocessing", "Normalization", "Correlation", "Factor analysis", "Weight estimation", "Bootstrap",
+        "Sub-factor scores", "Factor scores", "Overall Wellness Score"])
  
  
 # ------------------------------------------------------------------ helpers
@@ -44,8 +43,10 @@ def cached_run(df, cfg, alpha, B, seed):
  
 def read_upload(file):
     if file.name.lower().endswith((".xlsx", ".xls")):
-        return pd.read_excel(file)
-    return pd.read_csv(file)
+        data = pd.read_excel(file)
+    else:
+        data = pd.read_csv(file)
+    return we.normalize_input_columns(data)
  
  
 def short(c):
@@ -67,18 +68,25 @@ with st.sidebar:
     alpha = st.slider("Weight blend (α)", 0.0, 1.0, 0.5, 0.05,
                   help="α = 0 uses entropy weights only; α = 1 uses communality-based weights only; 0.5 combines both geometrically.")
     B = st.slider("Bootstrap resamples", 20, 400, 100, 20,
-                  help="More = more stable weights / CI, but slower (cached after first run).")
-    level = st.selectbox("Confidence level", [0.90, 0.95, 0.99], index=1, format_func=lambda v: f"{v:.0%}")
+                  help="More = more bootstrap resamples for the weight-stability estimate, but slower (cached after the first run).")
+    level = st.selectbox("Bootstrap interval level", [0.90, 0.95, 0.99], index=1, format_func=lambda v: f"{v:.0%}")
     st.divider()
     st.subheader("Overall factor weighting")
     profile_options = ["Balanced (equal weights)", "Custom", "Data-driven (explained variance)"]
     profile = st.selectbox(
-        "Overall weighting method",
+        "How should the available wellness factors be combined?",
         profile_options,
-        help=("Balanced: equal importance for each available factor. "
-              "Custom: you set relative importance. Data-driven: weights are estimated from "
-              "variation in the reference dataset; this does not mean they are objectively best.")
+        key="overall_weighting_v2",
+        help=("Balanced: each available factor has equal weight. "
+              "Custom: you assign relative importance. Data-driven: weights are estimated from "
+              "the variation and relationships in this dataset. Data-driven does not mean more important to every buyer.")
     )
+    if profile == "Balanced (equal weights)":
+        st.caption("Each available factor contributes equally to the overall score.")
+    elif profile == "Custom":
+        st.caption("Set relative factor importance from 0 to 3. Values are normalized to sum to 100%; 0 excludes a factor. Sliders for factors absent from the uploaded data are ignored.")
+    else:
+        st.caption("Weights are derived from PCA of the available factor scores. This reflects data structure, not personal priorities.")
     custom_w = {}
     if profile == "Custom":
         for code, f in we.HIERARCHY.items():
@@ -86,11 +94,3 @@ with st.sidebar:
     st.divider()
     st.subheader("LLM explanation (Groq)")
     if not (get_token() and not st.session_state.get("groq_key_input")):
-        st.text_input("Groq API key (kept only in this session)", type="password", key="groq_key_input",
-                      help="Better: put GROQ_API_KEY in Streamlit Secrets or an environment variable.")
-    hf_model = st.text_input("Model", "llama-3.3-70b-versatile")
- 
-tabs = st.tabs(["Data", "Factor pipeline", "Overall score", "Score new property", "Explanation", "Method"])
- 
-# ------------------------------------------------------------------ TAB 0: data
-cfg_base = we.default_config()
