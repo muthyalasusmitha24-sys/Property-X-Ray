@@ -3,7 +3,9 @@ theme.py  --  visual layer for Property X-Ray (colours, CSS, Plotly template, sm
 Pure presentation: nothing here touches the scoring logic.
 """
 import html
+import textwrap
 
+import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
@@ -24,19 +26,27 @@ BAND_EDGES = [(0, 35, "Poor"), (35, 50, "Below average"), (50, 65, "Moderate"),
               (65, 80, "Good"), (80, 100, "Excellent")]
 
 # ------------------------------------------------------------------ plotly template
+# automargin=True makes Plotly grow the margin to fit long axis labels (stops them being cut off / overlapping).
+# The legend sits top-RIGHT so it can never collide with a chart title (top-LEFT).
 pio.templates["xray"] = go.layout.Template(layout=dict(
     font=dict(family="Inter, system-ui, sans-serif", color=INK, size=13),
     colorway=COLORWAY,
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     title=dict(font=dict(family="Fraunces, Georgia, serif", size=18, color=TEAL_DARK), x=0.01),
-    margin=dict(l=10, r=10, t=55, b=10),
-    xaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, ticks="outside", tickcolor=LINE),
-    yaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text=""),
+    margin=dict(l=10, r=20, t=60, b=10),
+    xaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, ticks="outside", tickcolor=LINE,
+               automargin=True, title=dict(standoff=12)),
+    yaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, automargin=True, title=dict(standoff=12)),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title_text=""),
     hoverlabel=dict(bgcolor="white", bordercolor=LINE, font=dict(family="Inter", color=INK)),
     colorscale=dict(diverging=DIVERGING, sequential=SEQUENTIAL),
 ))
 pio.templates.default = "xray"
+
+
+def wrap(text, width=24):
+    """Insert <br> so long axis labels wrap instead of running into the plot."""
+    return "<br>".join(textwrap.wrap(str(text), width=width, break_long_words=False)) or str(text)
 
 
 def show(fig, container=st, **kw):
@@ -65,6 +75,32 @@ def add_band_zones(fig, axis="x"):
             fig.add_vrect(x0=lo, x1=hi, **kw)
         else:
             fig.add_hrect(y0=lo, y1=hi, **kw)
+    return fig
+
+
+def heatmap(z, xlabels, ylabels, zmin=-1.0, zmax=1.0, text=True, text_size=10, cbar_title="",
+            boundaries=None, xhover=None, hover_label="value", height=None):
+    """Readable heat-map: every tick label is forced to show, margins grow to fit them, optional
+    cell values, and optional separator lines (`boundaries` = row/column indices where a new group starts)."""
+    zv = np.asarray(z, dtype=float)
+    nrow, ncol = zv.shape
+    custom = np.tile(np.asarray(xhover if xhover is not None else xlabels, dtype=object), (nrow, 1))
+    fig = go.Figure(go.Heatmap(
+        z=zv, x=list(xlabels), y=list(ylabels), zmin=zmin, zmax=zmax, colorscale=DIVERGING,
+        xgap=1, ygap=1, customdata=custom,
+        text=np.round(zv, 2) if text else None, texttemplate="%{text:.2f}" if text else None,
+        textfont=dict(size=text_size, color=INK),
+        colorbar=dict(title=dict(text=cbar_title, side="right"), thickness=12, len=0.85),
+        hovertemplate="%{y}<br>vs %{customdata}<br>" + hover_label + " = %{z:.2f}<extra></extra>"))
+    fig.update_xaxes(side="top", type="category", tickmode="array", tickvals=list(xlabels),
+                     ticktext=list(xlabels), tickangle=0, showgrid=False, ticks="")
+    fig.update_yaxes(autorange="reversed", type="category", tickmode="array", tickvals=list(ylabels),
+                     ticktext=list(ylabels), showgrid=False, ticks="")
+    for b in (boundaries or []):
+        fig.add_shape(type="line", x0=-0.5, x1=ncol - 0.5, y0=b - 0.5, y1=b - 0.5, line=dict(color=INK, width=1.6))
+        if ncol == nrow:
+            fig.add_shape(type="line", x0=b - 0.5, x1=b - 0.5, y0=-0.5, y1=nrow - 0.5, line=dict(color=INK, width=1.6))
+    fig.update_layout(height=height or max(320, 30 * nrow + 140), margin=dict(l=10, r=10, t=70, b=10))
     return fig
 
 
@@ -107,8 +143,14 @@ def section(title, sub=None):
     st.markdown(s + "</div>", unsafe_allow_html=True)
 
 
+def stage_note(what, used):
+    """Two-line card shown at the top of every pipeline stage: what happens, and where the result is used next."""
+    st.markdown(f"<div class='xr-note'><div><b>What happens here</b><br>{html.escape(what)}</div>"
+                f"<div><b>Where the result is used</b><br>{html.escape(used)}</div></div>", unsafe_allow_html=True)
+
+
 def hero(title, subtitle, steps):
-    chips = "".join(f"<span class='xr-chip'>{html.escape(s)}</span>" for s in steps)
+    chips = "".join(f"<span class='xr-chip'>{i + 1} · {html.escape(s)}</span>" for i, s in enumerate(steps))
     st.markdown(f"""
 <div class='xr-hero'>
   <div class='xr-eyebrow'>PROPERTY&nbsp;X-RAY</div>
@@ -127,7 +169,7 @@ def flag(severity, msg):
 
 
 def sidebar_brand():
-    st.markdown("<div class='xr-brand'><span>🏠</span><div><b>Property X-Ray</b>"
+    st.markdown("<div class='xr-brand'><span>PX</span><div><b>Property X-Ray</b>"
                 "<small>Wellness Score engine</small></div></div>", unsafe_allow_html=True)
 
 
@@ -161,8 +203,15 @@ h1, h2, h3, h4 {{ font-family: 'Fraunces', Georgia, serif !important; color: {TE
 .xr-section h3 {{ margin: 0; font-size: 1.45rem; }}
 .xr-section p {{ margin: 2px 0 0; color: {MUTED}; font-size: .92rem; }}
 
+/* stage note: what happens / where it is used */
+.xr-note {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; background: #EEF6F4; border: 1px solid {TEAL_SOFT};
+            border-left: 4px solid {TEAL}; border-radius: 12px; padding: 12px 16px; margin: 2px 0 14px;
+            font-size: .9rem; color: {INK}; line-height: 1.45; }}
+.xr-note b {{ color: {TEAL_DARK}; font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; }}
+@media (max-width: 800px) {{ .xr-note {{ grid-template-columns: 1fr; }} }}
+
 /* tabs as pills */
-div[data-baseweb="tab-list"] {{ gap: 6px; background: #EFEBE1; padding: 5px; border-radius: 14px; width: fit-content; }}
+div[data-baseweb="tab-list"] {{ gap: 6px; background: #EFEBE1; padding: 5px; border-radius: 14px; width: fit-content; max-width: 100%; flex-wrap: wrap; }}
 button[data-baseweb="tab"] {{ height: 40px; border-radius: 10px; padding: 0 18px; font-weight: 500; color: {MUTED}; background: transparent; }}
 button[data-baseweb="tab"][aria-selected="true"] {{ background: white; color: {TEAL_DARK}; box-shadow: 0 1px 4px #0000001a; }}
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] {{ display: none; }}
@@ -183,7 +232,8 @@ div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] {{ display: no
 [data-testid="stSidebar"] {{ background: linear-gradient(180deg, #FFFFFF 0%, #F1EEE5 100%); border-right: 1px solid {LINE}; }}
 [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{ font-size: 1.05rem; }}
 .xr-brand {{ display: flex; align-items: center; gap: 12px; padding: 4px 0 14px; }}
-.xr-brand span {{ font-size: 1.7rem; background: {TEAL}; border-radius: 12px; padding: 6px 9px; }}
+.xr-brand span {{ font-family: 'Fraunces', serif; font-weight: 600; font-size: 1.05rem; color: white; background: {TEAL};
+                  border-radius: 12px; padding: 9px 11px; letter-spacing: .04em; }}
 .xr-brand b {{ display: block; font-family: 'Fraunces', serif; font-size: 1.15rem; color: {TEAL_DARK}; line-height: 1.1; }}
 .xr-brand small {{ color: {MUTED}; }}
 
