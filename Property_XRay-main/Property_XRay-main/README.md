@@ -1,34 +1,37 @@
 Property X-Ray — Wellness Score
-A Streamlit application for exploring a transparent 0–100 property-wellness index.
+A Streamlit application that converts property measurements into sub-factor scores, wellness-factor scores, and an overall model-defined Wellness Score.
+Interpretation note: this is a data-dependent scoring index, not a certified property rating, probability, or guarantee of quality. Statistical diagnostics help assess the data but do not by themselves validate the score.
+
 Files
-- app.py — revised Streamlit interface, clearer configuration labels, weighting choices, method explanations, and chart readability improvements.
-- wellness_engine.py — scoring engine.
-- theme.py — visual theme and shared chart/UI helpers.
-- requirements.txt — Python dependencies.
-- METHODOLOGY.md — detailed pipeline, formulas, examples, assumptions, and interpretation guide.
-Important factor-code convention
-- EMO = Emotional Wellness.
-- ENV = Environmental Wellness.
-Do not use EMO to label Environmental Wellness.
-Scoring pipeline
-Raw property data → data preprocessing → direction-aware 0–100 normalization → correlation diagnostics → factor analysis → communality and entropy weights → geometric weight combination → bootstrap re-estimation → parameter-weighted sub-factor scores → PCA/eigenvalue-based sub-factor weights → factor scores → overall score.
-
-Read METHODOLOGY.md before interpreting the weights. In particular, data-driven weights measure variation in the reference dataset; they do not determine what matters most to a buyer.
+- app.py — Streamlit user interface, input configuration, charts, and explanations.
+- wellness_engine.py — preprocessing, normalization, factor analysis, parameter weights, bootstrap stability, and scoring.
+- theme.py — existing visual styling and chart helpers (unchanged by this patch).
+- requirements.txt — existing dependencies (unchanged by this patch).
+- METHODOLOGY.md — detailed calculations, formulas, worked examples, flowchart, and limitations.
 Run locally
-Use Python 3.11 or 3.12 for broad compatibility.
 python -m venv .venv
-# Windows:
-.venv\\Scripts\\activate
-# macOS/Linux:
-source .venv/bin/activate
-
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
-The command requires app.py. It was not among the files supplied for this review, so the existing UI labels, configuration table, and overlapping charts cannot be verified or fixed in this bundle until that file is provided.
-Input data
-Use one row per property and parameter columns named CODE: Parameter, such as ENV: AQI value. An optional Property_ID can label rows. Numeric measurements should use consistent units. Categorical values need documented numeric encoding before scoring.
-Known limitations
-- If benchmark bounds are absent, normalization is relative to cleaned training-data minima and maxima.
-- The reported uncertainty interval represents bootstrap weighting uncertainty, not measurement error or total model uncertainty.
-- Factor-analysis and PCA-derived weights are data-dependent, not expert judgements.
-- The default synthetic data are only for exercising the pipeline and are not evidence about real properties.
+Deploy through GitHub and Streamlit Community Cloud
+1. Replace only the changed files supplied with this patch (app.py, wellness_engine.py, and METHODOLOGY.md) in the existing repository. README.md is optional documentation.
+2. Keep theme.py and requirements.txt from your existing repository; they are not changed by this patch.
+3. Commit and push to the branch connected to Streamlit Community Cloud. Streamlit will redeploy from the repository.
+4. If deployment fails, read the first traceback in Streamlit's app logs. Do not change Python versions or dependency versions blindly; the current requirements already specify the project's dependencies.
+Data format
+Upload CSV or Excel data with one property per row and exact template column names such as ENV: AQI value. Property_ID is optional. Environmental parameters use the ENV: prefix. Emotional wellness uses EMO:. Environmental parameter labels accidentally prefixed with EMO: are remapped to ENV: where the label matches. Legacy EMO: Noise levels and ENV: Noise levels (dB) headers are normalized to ENV: Noise levels; keep measurement units consistent and do not include duplicate columns for the same measurement.
+
+A factor is fitted when at least three configured columns are present, but the model also needs enough non-constant numeric data. If a selected column has no numeric values, the app displays an error instead of inventing data.
+Weighting choices
+- Balanced: equal weights across available wellness factors.
+- Custom: user-defined relative weights, normalized to sum to one.
+- Data-driven: PCA-derived weights based on the structure of the available factor scores.
+Subjective persona presets were removed because their numerical values did not have a documented empirical or expert-elicitation basis.
+Optional Groq explanation
+The Explanation tab can request a narrative from Groq. Configure GROQ_API_KEY using Streamlit Secrets, an environment variable, or the session-only sidebar field. Never commit a real API key.
+Main limitations
+- Without benchmark bounds, normalization depends on the reference dataset.
+- Bootstrap intervals represent weight-estimation uncertainty only, not measurement error or model-choice uncertainty.
+- Data-derived weights reflect statistical variation, not universal buyer priorities.
+- Synthetic data are for software testing only.
