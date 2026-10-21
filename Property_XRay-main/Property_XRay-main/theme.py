@@ -30,8 +30,8 @@ pio.templates["xray"] = go.layout.Template(layout=dict(
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     title=dict(font=dict(family="Fraunces, Georgia, serif", size=18, color=TEAL_DARK), x=0.01),
     margin=dict(l=10, r=10, t=55, b=10),
-    xaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, ticks="outside", tickcolor=LINE),
-    yaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE),
+    xaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, ticks="outside", tickcolor=LINE, automargin=True),
+    yaxis=dict(gridcolor="#EAE6DB", zeroline=False, linecolor=LINE, automargin=True),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text=""),
     hoverlabel=dict(bgcolor="white", bordercolor=LINE, font=dict(family="Inter", color=INK)),
     colorscale=dict(diverging=DIVERGING, sequential=SEQUENTIAL),
@@ -81,10 +81,99 @@ def gauge(value, title, height=250):
     return fig
 
 
+# ------------------------------------------------------------------ label-safe chart helpers
+def heatmap(mat, group_sizes=None, text=None, zmin=-1.0, zmax=1.0, colorscale=None, cbar_title="", x_title=None, fmt=".2f"):
+    """Heat-map with EVERY label shown (no skipping / overlapping), values printed when the grid is small,
+    and optional separator lines between groups (e.g. sub-factors)."""
+    n_r, n_c = mat.shape
+    show_text = (n_r <= 14 and n_c <= 14) if text is None else text
+    fig = go.Figure(go.Heatmap(
+        z=mat.values, x=list(mat.columns), y=list(mat.index), colorscale=colorscale or DIVERGING,
+        zmin=zmin, zmax=zmax, xgap=1, ygap=1,
+        colorbar=dict(thickness=12, len=0.85, title=dict(text=cbar_title, side="right")),
+        texttemplate=f"%{{z:{fmt}}}" if show_text else None, textfont=dict(size=11),
+        hovertemplate="%{y}<br>%{x}<br>value: %{z:.2f}<extra></extra>"))
+    fig.update_xaxes(type="category", dtick=1, tickangle=-45, side="bottom", tickfont=dict(size=11),
+                     showgrid=False, ticks="", automargin=True, title=x_title)
+    fig.update_yaxes(type="category", dtick=1, autorange="reversed", tickfont=dict(size=11),
+                     showgrid=False, ticks="", automargin=True)
+    if group_sizes:
+        pos = 0
+        for size in group_sizes[:-1]:
+            pos += size
+            fig.add_vline(x=pos - 0.5, line_width=2, line_color=INK, opacity=0.55)
+            fig.add_hline(y=pos - 0.5, line_width=2, line_color=INK, opacity=0.55)
+    fig.update_layout(height=max(380, 27 * n_r + 230), margin=dict(l=10, r=10, t=20, b=10))
+    return fig
+
+
+def dumbbell(labels, a, b, mid, a_name, b_name, mid_name, xtitle):
+    """One row per label: two dots joined by a line (a vs b) and a diamond for the blend."""
+    labels = list(labels)
+    xs, ys = [], []
+    for lab, x1, x2 in zip(labels, a, b):
+        xs += [x1, x2, None]
+        ys += [lab, lab, None]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(color="#C9D3D1", width=3), hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=list(a), y=labels, mode="markers", name=a_name,
+                             marker=dict(color=TEAL, size=11, line=dict(color="white", width=1.5))))
+    fig.add_trace(go.Scatter(x=list(b), y=labels, mode="markers", name=b_name,
+                             marker=dict(color=CORAL, size=11, line=dict(color="white", width=1.5))))
+    fig.add_trace(go.Scatter(x=list(mid), y=labels, mode="markers", name=mid_name,
+                             marker=dict(color=TEAL_DARK, size=12, symbol="diamond", line=dict(color="white", width=1.5))))
+    fig.update_yaxes(type="category", categoryorder="array", categoryarray=labels, autorange="reversed", dtick=1,
+                     tickfont=dict(size=12))
+    fig.update_xaxes(title=xtitle, rangemode="tozero")
+    fig.update_layout(height=max(380, 30 * len(labels) + 140))
+    return fig
+
+
+def range_plot(names, score, lo, hi, bands, level):
+    """Horizontal dot-and-whisker chart: one row per property, coloured by band, with background band zones."""
+    names = list(names)
+    score, lo, hi = list(score), list(lo), list(hi)
+    fig = go.Figure(go.Scatter(
+        x=score, y=names, mode="markers",
+        marker=dict(size=11, color=[BAND_COLORS[b] for b in bands], line=dict(color="white", width=1.5)),
+        error_x=dict(type="data", symmetric=False, color="#8D999C", thickness=2, width=5,
+                     array=[h - s_ for h, s_ in zip(hi, score)], arrayminus=[s_ - l for s_, l in zip(score, lo)]),
+        customdata=list(zip(lo, hi, bands)),
+        hovertemplate="%{y}<br>score %{x:.1f}<br>" + f"{level:.0%}" + " range %{customdata[0]:.1f} – %{customdata[1]:.1f}<br>%{customdata[2]}<extra></extra>"))
+    add_band_zones(fig, "x")
+    fig.update_yaxes(type="category", categoryorder="array", categoryarray=names, autorange="reversed", dtick=1,
+                     tickfont=dict(size=12))
+    fig.update_xaxes(range=[max(0, min(lo) - 6), min(100, max(hi) + 6)], title="Wellness Score (0–100)")
+    fig.update_layout(height=max(360, 26 * len(names) + 120), showlegend=False)
+    return fig
+
+
+def waterfall(contrib, total, total_label="Wellness Score", xtitle="Points contributed"):
+    """Horizontal waterfall: each bar = score x weight; bars add up to the total."""
+    labels = list(contrib.index) + [total_label]
+    vals = [float(v) for v in contrib.values] + [float(total)]
+    fig = go.Figure(go.Waterfall(
+        orientation="h", measure=["relative"] * len(contrib) + ["total"], y=labels, x=vals,
+        text=[f"{v:.1f}" for v in vals], textposition="outside", cliponaxis=False,
+        connector=dict(line=dict(color=MUTED, width=1, dash="dot")),
+        increasing=dict(marker=dict(color=TEAL)), totals=dict(marker=dict(color=TEAL_DARK))))
+    fig.update_yaxes(type="category", categoryorder="array", categoryarray=labels, autorange="reversed", dtick=1,
+                     tickfont=dict(size=12))
+    fig.update_xaxes(title=xtitle, range=[0, max(vals) * 1.12])
+    fig.update_layout(height=max(320, 40 * len(labels) + 90), showlegend=False)
+    return fig
+
+
+def stage(num, title, sub):
+    """Big numbered banner that separates the pipeline stages."""
+    st.markdown(f"<div class='xr-stage'><span>{num}</span><div><b>{html.escape(title)}</b>"
+                f"<small>{html.escape(sub)}</small></div></div>", unsafe_allow_html=True)
+
+
 # ------------------------------------------------------------------ dataframe styling
 def style_df(df, precision=1):
     """Round numbers and colour-code a 'Band' column if present."""
-    sty = df.style.format(precision=precision)
+    sty = df.style.format(precision=precision, na_rep="")
     if "Band" in df.columns:
         fn = sty.map if hasattr(sty, "map") else sty.applymap
         sty = fn(lambda v: f"background-color:{BAND_BG.get(v, 'transparent')};"
@@ -203,6 +292,14 @@ hr {{ border-color: {LINE}; margin: 1.6rem 0; }}
 
 /* flags */
 .xr-flag {{ border-left: 4px solid; padding: 9px 14px; border-radius: 8px; margin: 6px 0; font-size: .92rem; }}
+
+/* pipeline stage banner */
+.xr-stage {{ display: flex; align-items: center; gap: 16px; background: {CARD}; border: 1px solid {LINE}; border-radius: 16px;
+             padding: 14px 20px; margin: 22px 0 12px; box-shadow: 0 1px 2px #0000000a; }}
+.xr-stage span {{ background: {TEAL}; color: white; font-family: 'Fraunces', serif; font-size: 1.5rem; font-weight: 600;
+                  width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex: none; }}
+.xr-stage b {{ display: block; font-family: 'Fraunces', serif; font-size: 1.3rem; color: {TEAL_DARK}; }}
+.xr-stage small {{ color: {MUTED}; font-size: .92rem; }}
 
 /* explanation / method prose */
 .xr-prose {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 16px; padding: 18px 24px; }}
