@@ -3,7 +3,7 @@ wellness_engine.py  --  Property X-Ray : Wellness Score engine
 =================================================================
 Pipeline (applied independently to each of the 9 wellness factors):
  
-    Raw parameters -> Cleaning -> Normalisation -> Correlation matrix
+    Raw parameters -> Data preprocessing (cleaning + 0-100 scaling) -> Correlation matrix
     -> Factor analysis -> Factor loadings -> Entropy weighting
     -> Bootstrap validation -> Parameter weights -> Sub-factor scores
     -> Explained-variance weights -> Factor score
@@ -378,7 +378,7 @@ def fit_factor(df: pd.DataFrame, code: str, config: pd.DataFrame, boot_idx: np.n
     n = len(df)
     raw = df[columns].apply(pd.to_numeric, errors="coerce")
  
-    # ---- Step 2: CLEANING (coerce numeric, Tukey-fence winsorising, median imputation)
+    # ---- Step 2: DATA PREPROCESSING / cleaning (coerce numeric, IQR-fence capping, median imputation)
     q1, q3 = raw.quantile(.25), raw.quantile(.75)
     iqr = q3 - q1
     fence_lo = np.where(iqr > 0, q1 - 1.5 * iqr, raw.min())
@@ -390,7 +390,7 @@ def fit_factor(df: pd.DataFrame, code: str, config: pd.DataFrame, boot_idx: np.n
     cleaned = raw.fillna(clean_stats["median"])
     cleaned = pd.DataFrame(np.clip(cleaned.values, fence_lo, fence_hi), columns=columns, index=df.index)
  
-    # ---- Step 3: NORMALISATION (min-max 0-100, direction aware, optional benchmark bounds)
+    # ---- Step 3: DATA PREPROCESSING / scaling (min-max 0-100, direction aware, optional benchmark bounds)
     cfg_i = cfg.set_index("Column")
     mn = cfg_i["Min"].reindex(columns).astype(float)
     mx = cfg_i["Max"].reindex(columns).astype(float)
@@ -454,7 +454,7 @@ def fit_factor(df: pd.DataFrame, code: str, config: pd.DataFrame, boot_idx: np.n
         "cv": np.where(w_final > 0, wstd / np.maximum(w_final, 1e-12), np.nan),
         "final_weight": w_final}, index=columns)
     loadings = pd.DataFrame(base["L"], index=columns,
-                            columns=[f"Factor {i + 1}" for i in range(base["k"])])
+                            columns=[f"Theme {i + 1}" for i in range(base["k"])])
     result = FactorResult(
         code=code, name=f["name"], columns=columns, sub_map=sub_map,
         clean_stats=clean_stats, norm_stats=norm_stats, raw=raw, cleaned=cleaned, Xn=Xn,
@@ -552,65 +552,233 @@ def combine_overall(results: dict, factor_weights: dict | None, level: float = 0
  
  
 # --------------------------------------------------------------------------
-# 7. EXPLANATIONS
+# 7. TRANSPARENT CALCULATION TRACES  (every number shown in the app comes from here)
 # --------------------------------------------------------------------------
-def explain_factor(r: FactorResult, level: float = 0.95) -> str:
+def parameter_trace(r: FactorResult, row, col: str) -> pd.DataFrame:
+    """Follow ONE parameter of ONE property through the preprocessing steps."""
+    raw = r.raw.loc[row, col]
+    cs, ns = r.clean_stats.loc[col], r.norm_stats.loc[col]
+    missing = bool(pd.isna(raw))
+    filled = float(cs["median"]) if missing else float(raw)
+    cleaned = float(np.clip(filled, cs["lo"], cs["hi"]))
+    capped = (not missing) and abs(cleaned - filled) > 1e-12
+    span = float(ns["max"] - ns["min"])
+    scaled = 50.0 if span == 0 else float(np.clip((cleaned - ns["min"]) / span * 100, 0, 100))
+    lower = ns["direction"] == "lower"
+    final = 100 - scaled if lower else scaled
+    rows = [
+        ("1  Raw value", "The value as it appears in the data.", "blank (missing)" if missing else f"{raw:,.2f}",
+         "blank" if missing else f"{raw:,.2f}"),
+        ("2  Fill blank", "A missing value is replaced by the median of this parameter over all properties.",
+         f"median = {cs['median']:,.2f}" if missing else "not needed (value present)", f"{filled:,.2f}"),
+        ("3  Cap outliers",
+         "Values outside the IQR limits are pulled back to the nearest limit "
+         "(lower = Q1 − 1.5×IQR, upper = Q3 + 1.5×IQR).",
+         f"allowed range {cs['lo']:,.2f} to {cs['hi']:,.2f}" + ("  →  value was capped" if capped else "  →  within range"),
+         f"{cleaned:,.2f}"),
+        ("4  Scale to 0–100",
+         "(value − min) ÷ (max − min) × 100, where min / max are the " +
+         ("benchmark values you set." if ns["bounds"] == "benchmark" else "smallest / largest cleaned values in the data."),
+         f"({cleaned:,.2f} − {ns['min']:,.2f}) ÷ ({ns['max']:,.2f} − {ns['min']:,.2f}) × 100" if span else "min = max, so 50 is used",
+         f"{scaled:.1f}"),
+        ("5  Flip if lower is better",
+         "For parameters where a LOWER value is better (noise, AQI, price…), the score is turned around so 100 is always best.",
+         f"100 − {scaled:.1f}" if lower else "not needed (higher is better)", f"{final:.1f}"),
+    ]
+    return pd.DataFrame(rows, columns=["Step", "What happens", "Calculation", "Result"])
+
+
+def subfactor_trace(r: FactorResult, row, sub: str) -> pd.DataFrame:
+    """Parameter scores x weights -> sub-factor score (weighted average)."""
+    cols = r.sub_map[sub]
+    x = r.Xn.loc[row, cols].values.astype(float)
+    w = r.weights.loc[cols, "final_weight"].values.astype(float)
+    wn = w / w.sum() if w.sum() > 1e-12 else np.full(len(cols), 1 / len(cols))
+    df = pd.DataFrame({"Parameter": [c.split(": ", 1)[1] for c in cols], "Score (0–100)": x,
+                       "Final weight (% of whole factor)": w * 100, "Weight inside this sub-factor (%)": wn * 100,
+                       "Score × weight": x * wn})
+    df.loc[len(df)] = ["Sub-factor score", np.nan, np.nan, 100.0, float((x * wn).sum())]
+    return df
+
+
+def factor_trace(r: FactorResult, row) -> pd.DataFrame:
+    """Sub-factor scores x sub-factor weights -> factor score."""
+    subs = list(r.sub_map)
+    s_ = r.sub_scores.loc[row, subs].values.astype(float)
+    w = r.sub_weights.loc[subs].values.astype(float)
+    df = pd.DataFrame({"Sub-factor": subs, "Score (0–100)": s_, "Weight (%)": w * 100, "Score × weight": s_ * w})
+    df.loc[len(df)] = [f"{r.name} score", np.nan, 100.0, float((s_ * w).sum())]
+    return df
+
+
+def overall_trace(F: pd.DataFrame, fw: pd.Series, names: dict, row) -> pd.DataFrame:
+    """Factor scores x factor weights -> overall Wellness Score."""
+    sc = F.loc[row].values.astype(float)
+    w = fw.reindex(F.columns).values.astype(float)
+    df = pd.DataFrame({"Factor": [names[c] for c in F.columns], "Score (0–100)": sc, "Weight (%)": w * 100,
+                       "Score × weight": sc * w})
+    df.loc[len(df)] = ["Wellness Score", np.nan, 100.0, float((sc * w).sum())]
+    return df
+
+
+def weight_trace(r: FactorResult, col: str, alpha: float) -> pd.DataFrame:
+    """How ONE parameter's blended weight is formed from its two raw weights."""
+    w = r.weights
+    wl, we_ = float(w.loc[col, "loading_weight"]), float(w.loc[col, "entropy_weight"])
+    raw_blend = (w["loading_weight"] ** alpha * w["entropy_weight"] ** (1 - alpha))
+    comb = float(raw_blend[col] / raw_blend.sum())
+    rows = [
+        ("Communality h (sum of squared loadings)", f"{w.loc[col, 'communality']:.3f}", "How much of this parameter is explained by the hidden themes."),
+        ("Loading weight = h ÷ Σh", f"{wl * 100:.2f}%", "Share of the factor's weight from the shared pattern."),
+        ("Entropy weight", f"{we_ * 100:.2f}%", "Share of the factor's weight from how much it varies between properties."),
+        (f"Blend: loading^{alpha:g} × entropy^{1 - alpha:g}", f"{raw_blend[col]:.5f}", "Geometric blend (before rescaling)."),
+        ("Rescale so all blends add to 100%", f"{comb * 100:.2f}%", f"= {raw_blend[col]:.5f} ÷ {raw_blend.sum():.5f}"),
+        ("Bootstrap average (FINAL weight)", f"{w.loc[col, 'final_weight'] * 100:.2f}%",
+         f"Average over {len(r.boot_w)} resamples; spread = {w.loc[col, 'bootstrap_std'] * 100:.2f} points."),
+    ]
+    return pd.DataFrame(rows, columns=["Step", "Value", "Meaning"])
+
+
+def find_interesting(r: FactorResult):
+    """A (row, column) pair that shows something: a missing value, a capped outlier, else the first cell."""
+    na = r.raw.isna()
+    if na.values.any():
+        i, j = np.argwhere(na.values)[0]
+        return r.raw.index[i], r.raw.columns[j]
+    capped = r.raw.notna() & ((r.raw - r.cleaned).abs() > 1e-12)
+    if capped.values.any():
+        i, j = np.argwhere(capped.values)[0]
+        return r.raw.index[i], r.raw.columns[j]
+    return r.raw.index[0], r.raw.columns[0]
+
+
+def kmo_label(k: float) -> str:
+    if not np.isfinite(k):
+        return "n/a"
+    return ("marvellous" if k >= .9 else "meritorious" if k >= .8 else "middling" if k >= .7
+            else "mediocre" if k >= .6 else "poor" if k >= .5 else "unacceptable")
+
+
+# --------------------------------------------------------------------------
+# 8. BUYER PROFILES - what they mean
+# --------------------------------------------------------------------------
+PROFILE_INFO = {
+    "Balanced (equal weights)":
+        "No preference. Every one of the 9 wellness factors counts the same (11.1% each). Use it when you do not have a particular buyer in mind.",
+    "Young family":
+        "A household with children. Schools and learning, social life and a healthy environment matter most; career and spiritual factors matter least.",
+    "Retiree":
+        "Someone retired and not commuting. Health and physical comfort, spiritual wellbeing, calm (emotional) and environment matter most; job-related factors are almost ignored.",
+    "Working professional":
+        "Someone who lives there and commutes to work. Occupational factors (commute, jobs, coworking) matter most, then financial; spiritual and intellectual factors matter least.",
+    "Investor":
+        "Someone buying to earn returns. Financial (rent, ROI, price) and Statutory (legal papers, approvals) factors dominate; lifestyle factors count little.",
+    "Data-driven (explained variance)":
+        "No opinion about buyers. The weights are computed from the data itself (PCA explained variance): factors that carry more of the variation between properties get more weight. Neutral, but may not match what a buyer values.",
+    "Custom":
+        "You choose. Set a weight from 0 to 3 for each factor with the sliders; they are rescaled to add up to 100%.",
+}
+
+
+def profile_table(percent: bool = True) -> pd.DataFrame:
+    """Normalised factor weights of every fixed buyer profile (rows = factors)."""
+    d = {}
+    for name, w in BUYER_PROFILES.items():
+        t = sum(w.values())
+        d[name] = {HIERARCHY[c]["name"]: w[c] / t * (100 if percent else 1) for c in HIERARCHY}
+    return pd.DataFrame(d)
+
+
+def profile_headline(name: str) -> str:
+    """e.g. 'Highest weights: Intellectual 14.1% · Social 13.1% · Environmental 13.1%'."""
+    if name not in BUYER_PROFILES:
+        return ""
+    t = profile_table()[name].sort_values(ascending=False)
+    top = " · ".join(f"{i.replace(' Wellness', '')} {v:.1f}%" for i, v in t.head(3).items())
+    low = " · ".join(f"{i.replace(' Wellness', '')} {v:.1f}%" for i, v in t.tail(2).items())
+    return f"Highest: {top}.  Lowest: {low}."
+
+
+# --------------------------------------------------------------------------
+# 9. EXPLANATIONS
+# --------------------------------------------------------------------------
+def explain_factor(r: FactorResult, level: float = 0.95, alpha: float = 0.5) -> str:
     n, p = r.Xn.shape
     cs, w = r.clean_stats, r.weights.sort_values("final_weight", ascending=False)
     lo, hi = r.ci(level)
     var_k = r.eigenvalues[:r.n_factors].sum() / r.eigenvalues.sum() * 100
-    L = [f"### {r.name} – how the score was derived",
-         f"**1. Data.** {n} properties × {p} parameters in {len(r.sub_map)} sub-factors.",
-         f"**2. Cleaning.** {int(cs['missing'].sum())} missing cells were filled with the column median; "
-         f"{int(cs['outliers_clipped'].sum())} outliers were clipped to Tukey fences (1.5×IQR).",
-         f"**3. Normalisation.** Every parameter was scaled to 0-100 (min-max, using benchmark bounds where "
-         f"given). {int((r.norm_stats['direction'] == 'lower').sum())} 'lower is better' parameters were inverted.",
-         f"**4-5. Correlation & factor analysis.** KMO = {r.diagnostics['kmo']:.2f}, "
-         f"Bartlett p = {r.diagnostics['bartlett_p']:.3g}. {r.n_factors} common factor(s) retained "
-         f"(Kaiser eigenvalue>1, varimax) explaining ≈{var_k:.0f}% of variance.",
-         "**6-7. Loadings → entropy.** Parameter importance = communality (Σ loading²) blended with "
-         "Shannon-entropy dispersion weights (geometric mean).",
-         "**8-9. Bootstrap.** The whole weighting procedure was repeated on "
-         f"{len(r.boot_w)} resamples; final weights are the bootstrap means.",
-         "**Top parameter weights:** " + "; ".join(
-             f"{i.split(': ', 1)[1]} {v * 100:.1f}%" for i, v in zip(w.index[:5], w['final_weight'][:5])),
-         "**10-11. Sub-factor scores and explained-variance weights:** " + "; ".join(
-             f"{s} {v * 100:.0f}%" for s, v in r.sub_weights.sort_values(ascending=False).items()),
-         f"**12. Factor score.** Mean {r.score.mean():.1f} (min {r.score.min():.1f}, max {r.score.max():.1f}); "
-         f"average {level * 100:.0f}% CI width {(hi - lo).mean():.1f} points."]
+    kmo = r.diagnostics["kmo"]
+    n_low = int((r.norm_stats["direction"] == "lower").sum())
+    n_bench = int((r.norm_stats["bounds"] == "benchmark").sum())
+    unstable = int(((r.weights["cv"] > 0.6) & (r.weights["final_weight"] > 0)).sum())
+    top = w.head(5)
+    L = [f"### {r.name}: how the score was derived",
+         f"**The data.** {n} properties × {p} parameters, grouped into {len(r.sub_map)} sub-factors.",
+         "#### Stage 1 · Data preprocessing",
+         f"**Missing values:** {int(cs['missing'].sum())} blank cells were filled with the median of their parameter "
+         f"(the middle value, so one odd value cannot distort it).",
+         f"**Outliers:** {int(cs['outliers_clipped'].sum())} values lay outside the IQR limits "
+         f"(Q1 − 1.5×IQR … Q3 + 1.5×IQR) and were pulled back to the nearest limit.",
+         f"**Scaling:** every parameter was converted to a 0–100 score with (value − min) ÷ (max − min) × 100. "
+         f"{n_bench} parameter(s) use benchmark min/max you set; the rest use the smallest/largest value in the data. "
+         f"{n_low} parameter(s) are 'lower is better' and were flipped (100 − score), so 100 always means best.",
+         "#### Stage 2 · Finding the weights",
+         f"**Suitability.** KMO = {kmo:.2f} ({kmo_label(kmo)}); Bartlett's test p = {r.diagnostics['bartlett_p']:.3g}. "
+         "These tell us whether parameters are related enough for factor analysis to find a pattern.",
+         f"**Factor analysis.** {r.n_factors} hidden theme(s) were kept (eigenvalue > 1, varimax rotation), "
+         f"together explaining about {var_k:.0f}% of the variation. A parameter's loading weight is its communality "
+         "(how well the themes explain it) divided by the total.",
+         "**Entropy.** A parameter that differs a lot between properties carries more information, so it gets a larger entropy weight.",
+         f"**Blend.** The two weights are combined as loading^{alpha:g} × entropy^{1 - alpha:g}, then rescaled to 100%.",
+         f"**Bootstrap.** All of this was repeated on {len(r.boot_w)} random resamples of the properties; the final weight "
+         f"is the average. {unstable} parameter weight(s) are unstable (variation above 60% of the weight).",
+         "**Largest final weights:** " + "; ".join(
+             f"{i.split(': ', 1)[1]} {v * 100:.1f}% (loading {a * 100:.1f}%, entropy {b * 100:.1f}%)"
+             for i, v, a, b in zip(top.index, top["final_weight"], top["loading_weight"], top["entropy_weight"])),
+         "#### Stage 3 · Building the scores",
+         "**Sub-factor score** = weighted average of its parameters' scores. **Sub-factor weights** (PCA explained variance): "
+         + "; ".join(f"{s} {v * 100:.0f}%" for s, v in r.sub_weights.sort_values(ascending=False).items()) + ".",
+         f"**Factor score** = Σ sub-factor weight × sub-factor score. Mean {r.score.mean():.1f} "
+         f"(lowest {r.score.min():.1f}, highest {r.score.max():.1f}); average {level * 100:.0f}% confidence-interval width "
+         f"{(hi - lo).mean():.1f} points."]
     if r.flags:
-        L.append("**⚠ Possible flaws detected:**")
+        L.append("**⚠ Possible problems detected:**")
         L += [f"- ({s}) {m}" for s, m in r.flags]
     else:
-        L.append("**No automatic data-quality flags raised.**")
+        L.append("**No automatic data-quality flags were raised.**")
     return "\n\n".join(L)
- 
- 
+
+
 def explain_property(results: dict, F: pd.DataFrame, fw: pd.Series, overall: pd.Series,
                      lo: pd.Series, hi: pd.Series, row, profile: str, level: float = 0.95) -> str:
     L = [f"### Property {row}: Wellness Score **{overall[row]:.1f}** "
          f"({band(overall[row])}), {level * 100:.0f}% CI [{lo[row]:.1f}, {hi[row]:.1f}]",
-         f"Weight profile: **{profile}**.", "**Factor scores (weight → score):**"]
+         f"Weighting used: **{profile}**.", "**Factor scores (score × weight):**"]
     for c in F.columns:
-        L.append(f"- {results[c].name}: {F.loc[row, c]:.1f} (weight {fw[c] * 100:.1f}%)")
+        L.append(f"- {results[c].name}: {F.loc[row, c]:.1f} × {fw[c] * 100:.1f}% = {F.loc[row, c] * fw[c]:.1f} points")
     subs = []
     for c, r in results.items():
-        for s in r.sub_map:
-            subs.append((r.name, s, r.sub_scores.loc[row, s], r.sub_weights[s]))
+        for s_ in r.sub_map:
+            subs.append((r.name, s_, r.sub_scores.loc[row, s_]))
     subs.sort(key=lambda t: t[2])
-    L.append("**Weakest sub-factors:** " + "; ".join(f"{a} / {b} {v:.0f}" for a, b, v, _ in subs[:3]))
-    L.append("**Strongest sub-factors:** " + "; ".join(f"{a} / {b} {v:.0f}" for a, b, v, _ in subs[-3:][::-1]))
+    L.append("**Weakest sub-factors:** " + "; ".join(f"{a} / {b} {v:.0f}" for a, b, v in subs[:3]))
+    L.append("**Strongest sub-factors:** " + "; ".join(f"{a} / {b} {v:.0f}" for a, b, v in subs[-3:][::-1]))
+    # exact "points lost": effective weight of a parameter = sub-factor weight x its share inside the sub-factor
     drags = []
     for c, r in results.items():
-        gap = r.weights["final_weight"] * (100 - r.Xn.loc[row, r.columns].values) * fw[c]
-        for col, g in zip(r.columns, gap):
-            drags.append((col, g, r.Xn.loc[row, col]))
+        for sub, cols in r.sub_map.items():
+            wsub = r.weights.loc[cols, "final_weight"].values
+            share = wsub / wsub.sum() if wsub.sum() > 1e-12 else np.full(len(cols), 1 / len(cols))
+            for col, sh in zip(cols, share):
+                x = r.Xn.loc[row, col]
+                drags.append((col, r.sub_weights[sub] * sh * fw[c] * (100 - x), x))
     drags.sort(key=lambda t: -t[1])
-    L.append("**Biggest drags on the score (weight × shortfall):** " + "; ".join(
-        f"{c} (normalised {v:.0f}/100)" for c, _, v in drags[:5]))
+    L.append("**Biggest drags (points lost out of 100):** " + "; ".join(
+        f"{c} ({pts:.2f} points, scored {v:.0f}/100)" for c, pts, v in drags[:5]))
+    L.append(f"*Check: all parameters together lose {sum(d[1] for d in drags):.1f} points, and 100 − {overall[row]:.1f} = {100 - overall[row]:.1f}.*")
     return "\n\n".join(L)
- 
- 
+
+
 def llm_explain(context: str, token: str, model: str, question: str = "") -> str:
     """Ask a Groq-hosted LLM (OpenAI-compatible API) to narrate the derivation and critique it."""
     import requests
